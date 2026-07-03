@@ -16,8 +16,8 @@ HX711_ADC LoadCell_2(dout_2, sck_2);
 
 // --- UPDATE THESE VALUES WITH YOUR CALIBRATION FACTORS ---
 // Set to 1.0 initially to print raw values. Once calibrated in grams, replace with your factors.
-const float CAL_FACTOR_1 = 1.0; 
-const float CAL_FACTOR_2 = 1.0; 
+const float CAL_FACTOR_1 = 396.66; //405.02now
+const float CAL_FACTOR_2 = 379.83; //383.05; //379.83; 
 
 unsigned long lastPrintTime = 0;
 const int printInterval = 500; // Print data every 500ms
@@ -85,11 +85,13 @@ void loop() {
       float weight2_g = LoadCell_2.getData();
       float weight2_kg = weight2_g / 1000.0;
       
-      Serial.print("Scale 1: ");
-      Serial.print(weight1_g, 1);
-      Serial.print(" g (");
-      Serial.print(weight1_kg, 3);
-      Serial.print(" kg)  |  Scale 2: ");
+      // Serial.print("Scale 1: ");
+      // Serial.print(weight1_g, 1);
+      // Serial.print(" g (");
+      // Serial.print(weight1_kg, 3);
+      // Serial.print(" kg)"); 
+      // Serial.print(" kg |  Scale 2: ");
+      Serial.print("Scale 2: ");
       Serial.print(weight2_g, 1);
       Serial.print(" g (");
       Serial.print(weight2_kg, 3);
@@ -115,6 +117,6 @@ void loop() {
     Serial.println("Scale 1 tare complete.");
   }
   if (LoadCell_2.getTareStatus() == true) {
-    Serial.println("Scale 2 tare complete.");
+    //Serial.println("Scale 2 tare complete.");
   }
 }

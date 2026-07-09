@@ -18,6 +18,9 @@ CALIBRATION_OFFSET_CM = 0.5
 # Motion Detection Parameters (used to trigger automated scan)
 MOTION_THRESHOLD = 50000   # Min sum of changed pixels to register motion
 STILL_DURATION_SEC = 1.0   # How long the parcel must be still to trigger scan
+
+# Path where captured raw and measured images will be saved
+OUTPUT_DIR = r"D:\123\Cargo Info Capturing Unit\Parcel.Loading.System\Parcel Capture Images"
 # ---------------------
 
 # State Machine States
@@ -49,7 +52,6 @@ def detect_and_warp_mat(frame):
     blurred = cv2.GaussianBlur(gray, (7, 7), 0)
     
     # Threshold to isolate the dark mat (mat is dark, wood table is bright)
-    # Adjust threshold value (100) if mat detection is unstable under your lighting
     _, thresh = cv2.threshold(blurred, 100, 255, cv2.THRESH_BINARY_INV)
     
     # Clean up threshold mask
@@ -84,15 +86,16 @@ def detect_and_warp_mat(frame):
     # Sort corners in clockwise order
     sorted_pts = sort_corners(approx)
     
-    # Destination points for flat view
+    # Destination points for flat view (with a 0.5 cm margin to allow corner placement)
     dest_w = int(MAT_WIDTH_CM * WARP_SCALE)
     dest_h = int(MAT_HEIGHT_CM * WARP_SCALE)
+    margin_px = int(0.5 * WARP_SCALE)  # 0.5 cm crop margin
     
     dest_pts = np.float32([
-        [0, 0],
-        [dest_w - 1, 0],
-        [dest_w - 1, dest_h - 1],
-        [0, dest_h - 1]
+        [margin_px, margin_px],
+        [dest_w - 1 - margin_px, margin_px],
+        [dest_w - 1 - margin_px, dest_h - 1 - margin_px],
+        [margin_px, dest_h - 1 - margin_px]
     ])
     
     # Compute Homography Matrix
@@ -104,12 +107,21 @@ def detect_and_warp_mat(frame):
 def measure_parcel_in_mat(warped_mat):
     """Detects and measures the parcel inside the warped (flat) black mat."""
     gray = cv2.cvtColor(warped_mat, cv2.COLOR_BGR2GRAY)
+    
+    # 1. Standard Deviation Check: If the image has low contrast variance, the mat is empty!
+    std_dev = np.std(gray)
+    if std_dev < 15:  # Flat image (no parcel present)
+        return None, None, None, False
+        
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    # Since the mat is dark (values < 60) and the parcel is brighter:
-    # Threshold isolates the bright parcel against the dark mat background
-    _, thresh = cv2.threshold(blurred, 90, 255, cv2.THRESH_BINARY)
+    # 2. Otsu's automatic thresholding (no manual tuning needed, dim/bright room safe!)
+    otsu_thresh, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
+    # If the optimal Otsu threshold is below 85, it means the whole image is dark (no bright parcel)
+    if otsu_thresh < 85:
+        return None, None, None, False
+        
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
     closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
     dilated = cv2.dilate(closed, kernel, iterations=1)
@@ -119,36 +131,64 @@ def measure_parcel_in_mat(warped_mat):
     parcel_contour = None
     max_area = 0
     
+    # Warped image dimensions
+    w_h, w_w = warped_mat.shape[:2]
+    warped_area = w_h * w_w
+    
     for c in contours:
         area = cv2.contourArea(c)
-        if area > 1000:  # Ignore tiny noise
+        # Skip small noise, and skip contours > 75% of mat area (indicates mat border leakage)
+        if 1500 < area < (0.75 * warped_area):
             if area > max_area:
                 max_area = area
                 parcel_contour = c
                 
     if parcel_contour is None:
-        return None, None, None
+        return None, None, None, False
         
-    # Rotated bounding box in warped frame coordinates
-    min_area_rect = cv2.minAreaRect(parcel_contour)
-    box_points_warped = cv2.boxPoints(min_area_rect)
-    box_points_warped = np.float32(box_points_warped)
+    # 2. Find top face edges by polygon approximation of the parcel contour
+    perimeter = cv2.arcLength(parcel_contour, True)
+    approx = cv2.approxPolyDP(parcel_contour, 0.04 * perimeter, True)
     
-    (cx, cy), (w_px, h_px), angle = min_area_rect
+    # If the contour has 4 corners, it's a perfect top-down quad face!
+    if len(approx) == 4:
+        box_points_warped = approx.reshape(4, 2).astype(np.float32)
+    else:
+        # Fallback to minimum bounding rectangle if not exactly 4 corners
+        min_area_rect = cv2.minAreaRect(parcel_contour)
+        box_points_warped = cv2.boxPoints(min_area_rect)
+        box_points_warped = np.float32(box_points_warped)
+        
+    # Sort the corners in clockwise order
+    box_points_warped = sort_corners(box_points_warped)
     
-    # Convert pixels to cm
-    w_cm = w_px / WARP_SCALE
-    h_cm = h_px / WARP_SCALE
+    # Check if any corner of the box touches/crosses the mat borders (0.5 cm margin in warped pixels)
+    # This prevents false positives on border leakage and warns if parcel is placed off-mat!
+    border_margin_px = int(0.5 * WARP_SCALE)
+    is_on_boundary = False
+    for pt in box_points_warped:
+        x, y = pt[0], pt[1]
+        if (x <= border_margin_px or x >= (w_w - 1 - border_margin_px) or
+            y <= border_margin_px or y >= (w_h - 1 - border_margin_px)):
+            is_on_boundary = True
+            break
+            
+    # Calculate Length and Width of the Top Face in centimeters using Euclidean distance
+    side1 = np.linalg.norm(box_points_warped[0] - box_points_warped[1]) / WARP_SCALE
+    side2 = np.linalg.norm(box_points_warped[0] - box_points_warped[3]) / WARP_SCALE
     
-    # Subtract morphology dilation offset
-    length_cm = max(w_cm, h_cm) - CALIBRATION_OFFSET_CM
-    width_cm = min(w_cm, h_cm) - CALIBRATION_OFFSET_CM
+    length_cm = max(side1, side2) - CALIBRATION_OFFSET_CM
+    width_cm = min(side1, side2) - CALIBRATION_OFFSET_CM
     
-    return length_cm, width_cm, box_points_warped
+    return length_cm, width_cm, box_points_warped, is_on_boundary
 
 def main():
+    # Ensure capture folder exists
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
     print("--- Starting Mat-Tracking Automated Scanner ---")
     print(f"Tracking Mat: {MAT_WIDTH_CM} cm x {MAT_HEIGHT_CM} cm")
+    print(f"Saving Images to: {OUTPUT_DIR}")
     print("[+] Press 'q' to quit.")
     
     # Camera Initialization
@@ -184,146 +224,176 @@ def main():
     except Exception:
         pass
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    try:
+        while True:
+            # Check if the stream window was closed by the user clicking the "X" button
+            try:
+                if cv2.getWindowProperty("Automated Scanner Feed", cv2.WND_PROP_VISIBLE) < 1:
+                    print("[+] Stream window closed by user.")
+                    break
+            except Exception:
+                print("[+] Stream window closed.")
+                break
 
-        # 1. Motion Calculation (Frame Differencing)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray_blur = cv2.GaussianBlur(gray, (21, 21), 0)
-        frame_diff = cv2.absdiff(prev_gray, gray_blur)
-        thresh = cv2.threshold(frame_diff, 25, 255, cv2.THRESH_BINARY)[1]
-        motion_score = np.sum(thresh)
-        prev_gray = gray_blur.copy()
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        # 2. Mat Detection and Perspective Warp
-        warped_mat, mat_corners, M = detect_and_warp_mat(frame)
-        
-        display_frame = frame.copy()
-        length, width, box_points_original = None, None, None
-        
-        if warped_mat is not None:
-            # Draw blue outline around the tracked mat
-            cv2.polylines(display_frame, [mat_corners.astype(int)], True, (255, 0, 0), 2)
-            cv2.putText(display_frame, f"Tracked Mat ({MAT_WIDTH_CM}x{MAT_HEIGHT_CM}cm)", 
-                        (int(mat_corners[0][0]), int(mat_corners[0][1] - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+            # 1. Motion Calculation (Frame Differencing)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray_blur = cv2.GaussianBlur(gray, (21, 21), 0)
+            frame_diff = cv2.absdiff(prev_gray, gray_blur)
+            thresh = cv2.threshold(frame_diff, 25, 255, cv2.THRESH_BINARY)[1]
+            motion_score = np.sum(thresh)
+            prev_gray = gray_blur.copy()
+
+            # 2. Mat Detection and Perspective Warp
+            warped_mat, mat_corners, M = detect_and_warp_mat(frame)
             
-            # Measure parcel inside the warped mat
-            length, width, box_points_warped = measure_parcel_in_mat(warped_mat)
+            display_frame = frame.copy()
+            length, width, box_points_original = None, None, None
+            is_on_boundary = False
             
-            if length is not None:
-                # Project the box corners from warped space back to the original camera perspective!
-                M_inv = np.linalg.inv(M)
-                pts_warped = box_points_warped.reshape(-1, 1, 2)
-                pts_original = cv2.perspectiveTransform(pts_warped, M_inv)
-                box_points_original = np.intp(pts_original.reshape(-1, 2))
+            if warped_mat is not None:
+                # Draw blue outline around the tracked mat
+                cv2.polylines(display_frame, [mat_corners.astype(int)], True, (255, 0, 0), 2)
+                cv2.putText(display_frame, f"Tracked Mat ({MAT_WIDTH_CM}x{MAT_HEIGHT_CM}cm)", 
+                            (int(mat_corners[0][0]), int(mat_corners[0][1] - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
                 
-                # Draw live green measurement box on the camera feed
-                cv2.drawContours(display_frame, [box_points_original], 0, (0, 255, 0), 2)
-                cv2.putText(display_frame, f"{length:.1f}x{width:.1f} cm", 
-                            (box_points_original[0][0], box_points_original[0][1] - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-        # 3. State Machine for Automatic Capture
-        status_text = "Status: No Mat Detected"
-        status_color = (0, 0, 255)  # Red
-        
-        if warped_mat is not None:
-            if current_state == STATE_EMPTY:
-                status_text = "Status: Mat Tracked (Empty)"
-                status_color = (255, 0, 0)  # Blue
-                if motion_score > MOTION_THRESHOLD and length is not None:
-                    current_state = STATE_MOVING
-                    print("[+] Motion detected. Parcel entering mat...")
-                    
-            elif current_state == STATE_MOVING:
-                status_text = "Status: Scanning..."
-                status_color = (0, 165, 255)  # Orange
-                if motion_score < MOTION_THRESHOLD:
-                    current_state = STATE_STILL
-                    still_start_time = time.time()
-                    print("    - Motion stopped. Waiting for parcel to settle...")
-                    
-            elif current_state == STATE_STILL:
-                status_text = "Status: Settling..."
-                status_color = (0, 255, 255)  # Yellow
-                if motion_score > MOTION_THRESHOLD:
-                    current_state = STATE_MOVING
-                else:
-                    elapsed = time.time() - still_start_time
-                    if elapsed >= STILL_DURATION_SEC:
-                        print("[!] TRIGGER: Capturing parcel dimensions...")
-                        if length is not None:
-                            timestamp = int(time.time())
-                            repo_dir = os.path.dirname(os.path.abspath(__file__))
-                            
-                            # Save RAW Reference Frame (un-annotated)
-                            raw_path = os.path.join(repo_dir, f"raw_reference_{timestamp}.png")
-                            cv2.imwrite(raw_path, frame)
-                            
-                            # Draw clean, high-contrast overlay on the captured frame
-                            annotated = frame.copy()
-                            cv2.polylines(annotated, [mat_corners.astype(int)], True, (255, 0, 0), 2)
-                            cv2.drawContours(annotated, [box_points_original], 0, (0, 255, 0), 3)
-                            
-                            # Text labels with black backgrounds for visibility
-                            text_l = f"L: {length:.1f} cm"
-                            text_w = f"W: {width:.1f} cm"
-                            
-                            tx1, ty1 = int(box_points_original[0][0]), int(box_points_original[0][1] - 15)
-                            cv2.rectangle(annotated, (tx1 - 5, ty1 - 25), (tx1 + 160, ty1 + 5), (0, 0, 0), -1)
-                            cv2.putText(annotated, text_l, (tx1, ty1 - 5),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                                        
-                            tx2, ty2 = int(box_points_original[1][0]), int(box_points_original[1][1] - 15)
-                            cv2.rectangle(annotated, (tx2 - 5, ty2 - 25), (tx2 + 160, ty2 + 5), (0, 0, 0), -1)
-                            cv2.putText(annotated, text_w, (tx2, ty2 - 5),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                                        
-                            measured_path = os.path.join(repo_dir, f"measured_result_{timestamp}.png")
-                            cv2.imwrite(measured_path, annotated)
-                            
-                            print(f"\n=====================================")
-                            print(f"    AUTOMATED DISPATCH RESULT")
-                            print(f"    Length: {length:.1f} cm")
-                            print(f"    Width:  {width:.1f} cm")
-                            print(f"=====================================")
-                            print(f"[+] Saved RAW reference to: {raw_path}")
-                            print(f"[+] Saved MEASURED result to: {measured_path}")
-                            
-                            # Display result in topmost popup for 3 seconds
-                            cv2.imshow("Scan Result", annotated)
-                            try:
-                                cv2.setWindowProperty("Scan Result", cv2.WND_PROP_TOPMOST, 1)
-                            except Exception:
-                                pass
-                            cv2.waitKey(3000)
-                            cv2.destroyWindow("Scan Result")
-                        else:
-                            print("[-] Scan failed: Parcel was moved or lost.")
-                            
-                        current_state = STATE_WAIT_FOR_EXIT
+                # Measure parcel inside the warped mat
+                length, width, box_points_warped, is_on_boundary = measure_parcel_in_mat(warped_mat)
+                
+                if length is not None:
+                    try:
+                        # Project the box corners from warped space back to the original camera perspective!
+                        M_inv = np.linalg.inv(M)
+                        pts_warped = box_points_warped.reshape(-1, 1, 2)
+                        pts_original = cv2.perspectiveTransform(pts_warped, M_inv)
+                        box_points_original = np.intp(pts_original.reshape(-1, 2))
                         
-            elif current_state == STATE_WAIT_FOR_EXIT:
-                status_text = "Status: Scan Complete. Please remove parcel."
-                status_color = (0, 255, 0)  # Green
-                if motion_score > MOTION_THRESHOLD:
-                    time.sleep(1.0)
-                    current_state = STATE_EMPTY
-                    print("[+] Parcel removed. Ready for next scan.\n")
+                        if is_on_boundary:
+                            # Draw live RED warning box on the camera feed
+                            cv2.drawContours(display_frame, [box_points_original], 0, (0, 0, 255), 2)
+                            cv2.putText(display_frame, "OFF-MAT WARNING", 
+                                        (box_points_original[0][0], box_points_original[0][1] - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                            # Reject measurements for the state machine to prevent auto-scans
+                            length, width = None, None
+                        else:
+                            # Draw live green measurement box on the camera feed
+                            cv2.drawContours(display_frame, [box_points_original], 0, (0, 255, 0), 2)
+                            cv2.putText(display_frame, f"{length:.1f}x{width:.1f} cm", 
+                                        (box_points_original[0][0], box_points_original[0][1] - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    except np.linalg.LinAlgError:
+                        # Mat corners were collinear/singular; skip mapping this frame
+                        length, width, box_points_original = None, None, None
 
-        # Display Live Scanner Window
-        cv2.putText(display_frame, status_text, (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
-        cv2.imshow("Automated Scanner Feed", display_frame)
+            # 3. State Machine for Automatic Capture
+            status_text = "Status: No Mat Detected"
+            status_color = (0, 0, 255)  # Red
+            
+            if warped_mat is not None:
+                if current_state == STATE_EMPTY:
+                    status_text = "Status: Mat Tracked (Empty)"
+                    status_color = (255, 0, 0)  # Blue
+                    if motion_score > MOTION_THRESHOLD and length is not None:
+                        current_state = STATE_MOVING
+                        print("[+] Motion detected. Parcel entering mat...")
+                        
+                elif current_state == STATE_MOVING:
+                    status_text = "Status: Scanning..."
+                    status_color = (0, 165, 255)  # Orange
+                    if motion_score < MOTION_THRESHOLD:
+                        current_state = STATE_STILL
+                        still_start_time = time.time()
+                        print("    - Motion stopped. Waiting for parcel to settle...")
+                        
+                elif current_state == STATE_STILL:
+                    status_text = "Status: Settling..."
+                    status_color = (0, 255, 255)  # Yellow
+                    if motion_score > MOTION_THRESHOLD:
+                        current_state = STATE_MOVING
+                    else:
+                        elapsed = time.time() - still_start_time
+                        if elapsed >= STILL_DURATION_SEC:
+                            print("[!] TRIGGER: Capturing parcel dimensions...")
+                            if length is not None:
+                                timestamp = int(time.time())
+                                
+                                # Save RAW Reference Frame (un-annotated)
+                                raw_path = os.path.join(OUTPUT_DIR, f"raw_reference_{timestamp}.png")
+                                cv2.imwrite(raw_path, frame)
+                                
+                                # Draw clean, high-contrast overlay on the captured frame
+                                annotated = frame.copy()
+                                cv2.polylines(annotated, [mat_corners.astype(int)], True, (255, 0, 0), 2)
+                                cv2.drawContours(annotated, [box_points_original], 0, (0, 255, 0), 3)
+                                
+                                # Text labels with black backgrounds for visibility
+                                text_l = f"L: {length:.1f} cm"
+                                text_w = f"W: {width:.1f} cm"
+                                
+                                tx1, ty1 = int(box_points_original[0][0]), int(box_points_original[0][1] - 15)
+                                cv2.rectangle(annotated, (tx1 - 5, ty1 - 25), (tx1 + 160, ty1 + 5), (0, 0, 0), -1)
+                                cv2.putText(annotated, text_l, (tx1, ty1 - 5),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                                            
+                                tx2, ty2 = int(box_points_original[1][0]), int(box_points_original[1][1] - 15)
+                                cv2.rectangle(annotated, (tx2 - 5, ty2 - 25), (tx2 + 160, ty2 + 5), (0, 0, 0), -1)
+                                cv2.putText(annotated, text_w, (tx2, ty2 - 5),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                                            
+                                measured_path = os.path.join(OUTPUT_DIR, f"measured_result_{timestamp}.png")
+                                cv2.imwrite(measured_path, annotated)
+                                
+                                print(f"\n=====================================")
+                                print(f"    AUTOMATED DISPATCH RESULT")
+                                print(f"    Length: {length:.1f} cm")
+                                print(f"    Width:  {width:.1f} cm")
+                                print(f"=====================================")
+                                print(f"[+] Saved RAW reference to: {raw_path}")
+                                print(f"[+] Saved MEASURED result to: {measured_path}")
+                                
+                                # Display result in topmost popup for 3 seconds
+                                cv2.imshow("Scan Result", annotated)
+                                try:
+                                    cv2.setWindowProperty("Scan Result", cv2.WND_PROP_TOPMOST, 1)
+                                except Exception:
+                                    pass
+                                cv2.waitKey(3000)
+                                cv2.destroyWindow("Scan Result")
+                            else:
+                                print("[-] Scan failed: Parcel was moved or lost.")
+                                
+                            current_state = STATE_WAIT_FOR_EXIT
+                            
+                elif current_state == STATE_WAIT_FOR_EXIT:
+                    status_text = "Status: Scan Complete. Please remove parcel."
+                    status_color = (0, 255, 0)  # Green
+                    if motion_score > MOTION_THRESHOLD:
+                        time.sleep(1.0)
+                        current_state = STATE_EMPTY
+                        print("[+] Parcel removed. Ready for next scan.\n")
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            if is_on_boundary and warped_mat is not None:
+                status_text = "WARNING: Place parcel fully inside mat borders!"
+                status_color = (0, 0, 255)  # Red
 
-    cap.release()
-    cv2.destroyAllWindows()
+            # Display Live Scanner Window
+            cv2.putText(display_frame, status_text, (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+            cv2.imshow("Automated Scanner Feed", display_frame)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    except KeyboardInterrupt:
+        print("\n[+] Exiting safely via Ctrl+C...")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        print("[+] Camera and windows closed safely.")
 
 if __name__ == "__main__":
     main()

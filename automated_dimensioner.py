@@ -111,7 +111,7 @@ def measure_parcel_in_mat(warped_mat):
     # 1. Standard Deviation Check: If the image has low contrast variance, the mat is empty!
     std_dev = np.std(gray)
     if std_dev < 15:  # Flat image (no parcel present)
-        return None, None, None, False
+        return None, None, None, None, None, False
         
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     
@@ -120,7 +120,7 @@ def measure_parcel_in_mat(warped_mat):
     
     # If the optimal Otsu threshold is below 85, it means the whole image is dark (no bright parcel)
     if otsu_thresh < 85:
-        return None, None, None, False
+        return None, None, None, None, None, False
         
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
     closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
@@ -144,7 +144,7 @@ def measure_parcel_in_mat(warped_mat):
                 parcel_contour = c
                 
     if parcel_contour is None:
-        return None, None, None, False
+        return None, None, None, None, None, False
         
     # 2. Find top face edges by polygon approximation of the parcel contour
     perimeter = cv2.arcLength(parcel_contour, True)
@@ -179,8 +179,51 @@ def measure_parcel_in_mat(warped_mat):
     
     length_cm = max(side1, side2) - CALIBRATION_OFFSET_CM
     width_cm = min(side1, side2) - CALIBRATION_OFFSET_CM
+
+    # 3. Dynamic Height Estimation (3rd Dimension)
+    # Estimates height by dividing the perspective side projection area by the box length
+    min_area_rect = cv2.minAreaRect(parcel_contour)
+    outer_area = min_area_rect[1][0] * min_area_rect[1][1]
+    top_face_area = cv2.contourArea(parcel_contour)
     
-    return length_cm, width_cm, box_points_warped, is_on_boundary
+    side_area = max(0.0, outer_area - top_face_area)
+    box_length_px = max(min_area_rect[1][0], min_area_rect[1][1])
+    side_thickness_px = side_area / max(1.0, box_length_px)
+    
+    # For a 35-degree tilted camera, height_cm = (side_thickness_px / scale) / sin(35 degrees)
+    height_cm = (side_thickness_px / WARP_SCALE) / 0.57
+    height_cm = float(np.clip(height_cm, 2.0, 15.0)) # Clamp to realistic values
+
+    # 4. Material Type Classification using HSV color & texture properties
+    material = "Cardboard Box"
+    x_start = int(max(0, np.min(box_points_warped[:, 0])))
+    x_end = int(min(w_w, np.max(box_points_warped[:, 0])))
+    y_start = int(max(0, np.min(box_points_warped[:, 1])))
+    y_end = int(min(w_h, np.max(box_points_warped[:, 1])))
+    parcel_roi = warped_mat[y_start:y_end, x_start:x_end]
+    
+    if parcel_roi.size > 0:
+        hsv_roi = cv2.cvtColor(parcel_roi, cv2.COLOR_BGR2HSV)
+        h_channel, s_channel, v_channel = cv2.split(hsv_roi)
+        avg_h = np.mean(h_channel)
+        avg_s = np.mean(s_channel)
+        avg_v = np.mean(v_channel)
+        std_v = np.std(v_channel)
+        
+        # Cardboard: Brown/tan hue range (10-25) and moderate saturation (30-150)
+        if 10 <= avg_h <= 25 and 30 <= avg_s <= 150:
+            material = "Cardboard Box"
+        # Plastic mailer: Low saturation (white/grey) and high value (bright) with high reflection variance
+        elif avg_s < 30 and avg_v > 150:
+            if std_v > 35:
+                material = "Plastic Mailer"
+            else:
+                material = "Paper Envelope"
+        # Colorful plastic packaging
+        else:
+            material = "Packaging (Plastic)"
+            
+    return length_cm, width_cm, height_cm, material, box_points_warped, is_on_boundary
 
 def main():
     # Ensure capture folder exists
@@ -251,7 +294,7 @@ def main():
             warped_mat, mat_corners, M = detect_and_warp_mat(frame)
             
             display_frame = frame.copy()
-            length, width, box_points_original = None, None, None
+            length, width, height, material, box_points_original = None, None, None, None, None
             is_on_boundary = False
             
             if warped_mat is not None:
@@ -262,7 +305,7 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
                 
                 # Measure parcel inside the warped mat
-                length, width, box_points_warped, is_on_boundary = measure_parcel_in_mat(warped_mat)
+                length, width, height, material, box_points_warped, is_on_boundary = measure_parcel_in_mat(warped_mat)
                 
                 if length is not None:
                     try:
@@ -283,7 +326,7 @@ def main():
                         else:
                             # Draw live green measurement box on the camera feed
                             cv2.drawContours(display_frame, [box_points_original], 0, (0, 255, 0), 2)
-                            cv2.putText(display_frame, f"{length:.1f}x{width:.1f} cm", 
+                            cv2.putText(display_frame, f"{length:.1f}x{width:.1f}x{height:.1f} cm ({material})", 
                                         (box_points_original[0][0], box_points_original[0][1] - 10),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                     except np.linalg.LinAlgError:
@@ -334,6 +377,7 @@ def main():
                                 # Text labels with black backgrounds for visibility
                                 text_l = f"L: {length:.1f} cm"
                                 text_w = f"W: {width:.1f} cm"
+                                text_h = f"H: {height:.1f} cm ({material})"
                                 
                                 tx1, ty1 = int(box_points_original[0][0]), int(box_points_original[0][1] - 15)
                                 cv2.rectangle(annotated, (tx1 - 5, ty1 - 25), (tx1 + 160, ty1 + 5), (0, 0, 0), -1)
@@ -344,14 +388,21 @@ def main():
                                 cv2.rectangle(annotated, (tx2 - 5, ty2 - 25), (tx2 + 160, ty2 + 5), (0, 0, 0), -1)
                                 cv2.putText(annotated, text_w, (tx2, ty2 - 5),
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+                                tx3, ty3 = int(box_points_original[2][0]), int(box_points_original[2][1] - 15)
+                                cv2.rectangle(annotated, (tx3 - 5, ty3 - 25), (tx3 + 300, ty3 + 5), (0, 0, 0), -1)
+                                cv2.putText(annotated, text_h, (tx3, ty3 - 5),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                                             
                                 measured_path = os.path.join(OUTPUT_DIR, f"measured_result_{timestamp}.png")
                                 cv2.imwrite(measured_path, annotated)
                                 
                                 print(f"\n=====================================")
                                 print(f"    AUTOMATED DISPATCH RESULT")
-                                print(f"    Length: {length:.1f} cm")
-                                print(f"    Width:  {width:.1f} cm")
+                                print(f"    Length:   {length:.1f} cm")
+                                print(f"    Width:    {width:.1f} cm")
+                                print(f"    Height:   {height:.1f} cm")
+                                print(f"    Material: {material}")
                                 print(f"=====================================")
                                 print(f"[+] Saved RAW reference to: {raw_path}")
                                 print(f"[+] Saved MEASURED result to: {measured_path}")

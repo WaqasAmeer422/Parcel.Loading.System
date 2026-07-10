@@ -181,28 +181,45 @@ def measure_parcel_in_mat(warped_mat):
     width_cm = min(side1, side2) - CALIBRATION_OFFSET_CM
 
     # 3. Dynamic Height Estimation (3rd Dimension)
-    # Estimates height by dividing the perspective side projection area by the box length
-    min_area_rect = cv2.minAreaRect(parcel_contour)
-    outer_area = min_area_rect[1][0] * min_area_rect[1][1]
-    top_face_area = cv2.contourArea(parcel_contour)
-    
-    side_area = max(0.0, outer_area - top_face_area)
-    box_length_px = max(min_area_rect[1][0], min_area_rect[1][1])
-    side_thickness_px = side_area / max(1.0, box_length_px)
-    
-    # For a 35-degree tilted camera, height_cm = (side_thickness_px / scale) / sin(35 degrees)
-    height_cm = (side_thickness_px / WARP_SCALE) / 0.57
-    height_cm = float(np.clip(height_cm, 2.0, 15.0)) # Clamp to realistic values
-
-    # 4. Material Type Classification using HSV color & texture properties
-    material = "Cardboard Box"
+    # The outer bounding box (ROI) contains the entire 3D projection silhouette (top face + side face)
     x_start = int(max(0, np.min(box_points_warped[:, 0])))
     x_end = int(min(w_w, np.max(box_points_warped[:, 0])))
     y_start = int(max(0, np.min(box_points_warped[:, 1])))
     y_end = int(min(w_h, np.max(box_points_warped[:, 1])))
+    
     parcel_roi = warped_mat[y_start:y_end, x_start:x_end]
     
+    height_cm = 2.0  # Default fallback minimum height
+    material = "Paper / Cardboard"  # Default fallback material
+    
     if parcel_roi.size > 0:
+        # A. Local Thresholding inside ROI to separate bright top face from darker side shadow faces
+        roi_gray = cv2.cvtColor(parcel_roi, cv2.COLOR_BGR2GRAY)
+        roi_blurred = cv2.GaussianBlur(roi_gray, (5, 5), 0)
+        
+        # Local Otsu to extract only the brightest region (top face)
+        _, roi_thresh = cv2.threshold(roi_blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        roi_contours, _ = cv2.findContours(roi_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        max_roi_area = 0
+        for rc in roi_contours:
+            rc_area = cv2.contourArea(rc)
+            if rc_area > max_roi_area:
+                max_roi_area = rc_area
+                
+        roi_area = parcel_roi.shape[0] * parcel_roi.shape[1]
+        side_area = max(0.0, roi_area - max_roi_area)
+        
+        box_length_px = max(parcel_roi.shape[0], parcel_roi.shape[1])
+        side_thickness_px = side_area / max(1.0, box_length_px)
+        
+        # Calculate Height using perspective side face projection scale (sin(35 deg) approx 0.57)
+        height_cm = (side_thickness_px / WARP_SCALE) / 0.57
+        # Subtract minor calibration offset for vertical thickness projection
+        height_cm = height_cm - 0.5
+        height_cm = float(np.clip(height_cm, 2.0, 15.0))
+
+        # B. Material Type Classification using HSV color & texture properties
         hsv_roi = cv2.cvtColor(parcel_roi, cv2.COLOR_BGR2HSV)
         h_channel, s_channel, v_channel = cv2.split(hsv_roi)
         avg_h = np.mean(h_channel)
@@ -210,16 +227,15 @@ def measure_parcel_in_mat(warped_mat):
         avg_v = np.mean(v_channel)
         std_v = np.std(v_channel)
         
-        # Cardboard: Brown/tan hue range (10-25) and moderate saturation (30-150)
-        if 10 <= avg_h <= 25 and 30 <= avg_s <= 150:
-            material = "Cardboard Box"
-        # Plastic mailer: Low saturation (white/grey) and high value (bright) with high reflection variance
-        elif avg_s < 30 and avg_v > 150:
-            if std_v > 35:
+        # Cardboard / Paper: Low saturation or brown/tan hue (Hue 5-35)
+        # If it has extremely high reflection variance (std_v > 45), it is Plastic Mailer
+        if avg_s < 45 and avg_v > 130:
+            if std_v > 45:
                 material = "Plastic Mailer"
             else:
-                material = "Paper Envelope"
-        # Colorful plastic packaging
+                material = "Paper / Cardboard"
+        elif 5 <= avg_h <= 35 and 15 <= avg_s <= 180:
+            material = "Paper / Cardboard"
         else:
             material = "Packaging (Plastic)"
             

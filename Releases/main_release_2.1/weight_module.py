@@ -40,6 +40,8 @@ class WeightSensor:
         self._current_w1 = 0.0
         self._current_w2 = 0.0
         self._lock = threading.Lock()
+        self._hw_lock = threading.Lock()
+        self.reading_count = 0
         self._running = False
         self._thread = None
 
@@ -55,18 +57,19 @@ class WeightSensor:
         return True
 
     def _read_raw(self, dout, sck, timeout=READ_TIMEOUT_S):
-        if not self._wait_ready(dout, timeout=timeout):
-            return None
-        val = 0
-        for _ in range(24):
+        with self._hw_lock:
+            if not self._wait_ready(dout, timeout=timeout):
+                return None
+            val = 0
+            for _ in range(24):
+                lgpio.gpio_write(self.h, sck, 1)
+                lgpio.gpio_write(self.h, sck, 0)
+                val = (val << 1) | lgpio.gpio_read(self.h, dout)
             lgpio.gpio_write(self.h, sck, 1)
             lgpio.gpio_write(self.h, sck, 0)
-            val = (val << 1) | lgpio.gpio_read(self.h, dout)
-        lgpio.gpio_write(self.h, sck, 1)
-        lgpio.gpio_write(self.h, sck, 0)
-        if val & 0x800000:
-            val -= 1 << 24
-        return val
+            if val & 0x800000:
+                val -= 1 << 24
+            return val
 
     def tare(self, n=15):
         print("[WeightSensor] Taring... keep platform empty.")
@@ -132,6 +135,7 @@ class WeightSensor:
                 self._current_cog = cog_distance
                 self._current_w1 = w1
                 self._current_w2 = w2
+                self.reading_count += 1
             
             time.sleep(0.05)
 
@@ -157,6 +161,10 @@ class WeightSensor:
     def get_cog(self):
         with self._lock:
             return self._current_cog
+
+    def get_reading_count(self):
+        with self._lock:
+            return self.reading_count
 
     def stop(self):
         self._running = False

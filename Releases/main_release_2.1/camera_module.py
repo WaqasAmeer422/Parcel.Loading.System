@@ -134,10 +134,18 @@ def select_best_parcel_contour(contours, min_area: float, max_area: float):
 
 
 def touches_mat_border(box_points: np.ndarray, h: int, w: int) -> bool:
-    margin = int(WARP_MARGIN_CM * WARP_SCALE)
-    xs, ys = box_points[:, 0], box_points[:, 1]
-    return bool(np.any(xs <= margin) or np.any(xs >= w - 1 - margin) or
-                np.any(ys <= margin) or np.any(ys >= h - 1 - margin))
+    # 30px border mask + 2px safety margin
+    margin = 32
+    
+    # Count how many corners of the parcel's bounding box touch the border mask.
+    # - If 3 or 4 corners touch, it's a corner leak from outside the mat -> REJECT.
+    # - If 0, 1, or 2 corners touch, it's a valid parcel touching only one edge -> ALLOW.
+    count = 0
+    for pt in box_points:
+        x, y = pt[0], pt[1]
+        if x <= margin or x >= w - 1 - margin or y <= margin or y >= h - 1 - margin:
+            count += 1
+    return count >= 3
 
 
 def has_significant_holes(hierarchy, contours, parcel_idx: int) -> bool:
@@ -186,7 +194,12 @@ def find_top_face(roi: np.ndarray):
         return None, 0.0
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Clamp Otsu's threshold to a maximum of 110 to prevent white labels from
+    # shifting the threshold too high and ignoring the rest of the top face.
+    otsu_val, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    target_thresh = min(110, otsu_val)
+    _, mask = cv2.threshold(blurred, target_thresh, 255, cv2.THRESH_BINARY)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -200,7 +213,7 @@ def estimate_height_cm(footprint_area: float, top_face_area: float, box_px_span:
     side_thickness_px = side_area / max(1.0, box_px_span)
     apparent_cm = (side_thickness_px / WARP_SCALE) * HEIGHT_SCALE_FACTOR
     height_cm = (apparent_cm / _TILT_SIN) - HEIGHT_CALIBRATION_OFFSET_CM
-    print(f"[DEBUG Camera] Raw Unclipped Height: {height_cm:.2f} cm")
+    #print(f"[DEBUG Camera] Raw Unclipped Height: {height_cm:.2f} cm")
     return float(np.clip(height_cm, HEIGHT_MIN_CM, HEIGHT_MAX_CM))
 
 
@@ -238,9 +251,29 @@ def measure_parcel_in_mat(warped_mat: np.ndarray) -> Optional[ParcelResult]:
         return None
 
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    otsu_thresh, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if otsu_thresh < MIN_OTSU_THRESH:
+    
+    # 1. First, check if the mat is empty using Otsu threshold on the CENTRAL region.
+    # We ignore the outer 30 pixels of the warped mat to exclude white corner rips
+    # or wooden desk leakage on the edges from the contrast calculation.
+    h, w = blurred.shape
+    border = 30
+    inner_mat = blurred[border:h-border, border:w-border]
+    
+    otsu_val, _ = cv2.threshold(inner_mat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if otsu_val < MIN_OTSU_THRESH:
         return None
+        
+    # 2. A parcel is present! Use a fixed threshold of 75 to segment the dark black mat.
+    # This filters out minor scuff marks, dust, and reflections on the empty mat (which are < 70),
+    # while still easily capturing cardboard boxes (typically > 90) and white labels.
+    FIXED_MAT_THRESH = 75
+    _, thresh = cv2.threshold(blurred, FIXED_MAT_THRESH, 255, cv2.THRESH_BINARY)
+    
+    # Clear the outer borders of the threshold mask to ignore table leaks or corner rips
+    thresh[0:border, :] = 0        # Top border
+    thresh[h-border:h, :] = 0      # Bottom border
+    thresh[:, 0:border] = 0        # Left border
+    thresh[:, w-border:w] = 0      # Right border
 
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
     dilated = cv2.dilate(cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel), kernel, iterations=1)
@@ -293,8 +326,8 @@ def measure_parcel_in_mat(warped_mat: np.ndarray) -> Optional[ParcelResult]:
     material_class, material_detail = classify_material(roi, object_type)
 
     # Debug print to identify exact height measurement issue
-    print(f"\n[DEBUG Camera] Footprint Area: {area:.1f} px | Top Face Area: {top_face_area if top_face_valid else 0.0:.1f} px")
-    print(f"[DEBUG Camera] Raw Calculated Height: {height_cm:.2f} cm (Will be clipped to range {HEIGHT_MIN_CM}-{HEIGHT_MAX_CM} cm)")
+    #print(f"\n[DEBUG Camera] Footprint Area: {area:.1f} px | Top Face Area: {top_face_area if top_face_valid else 0.0:.1f} px")
+    #print(f"[DEBUG Camera] Raw Calculated Height: {height_cm:.2f} cm (Will be clipped to range {HEIGHT_MIN_CM}-{HEIGHT_MAX_CM} cm)")
 
     return ParcelResult(length_cm, width_cm, height_cm, material_class, material_detail,
                          object_type, dim_quad, is_on_boundary)
